@@ -54,22 +54,33 @@ def get_all_pages(url: str, params: dict, access_token: str) -> list:
     """Follow Graph API cursor pagination (paging.next) and return every
     item in "data" across all pages.
 
+    access_token is sent as an `access_token` query parameter, not an
+    `Authorization: Bearer` header -- every example in Meta's own docs
+    (the general Graph API guide, the Insights guide, and the breakdowns
+    reference, all fetched 2026-08-20) uses the query parameter form
+    exclusively; none show a Bearer header. Meta's Graph API is also known
+    to surface access-token problems as HTTP 400 (OAuthException), not 401,
+    which is why a bad-auth failure here looks like a "malformed request"
+    rather than an auth error.
+
     Meta's paging model: each response has {"data": [...], "paging": {
     "cursors": {"after": ...}, "next": "<full url for the next page>"}}.
     Absence of "next" (not absence of "cursors") is what signals the last
-    page -- a short final page can still carry a cursors object.
+    page -- a short final page can still carry a cursors object. Meta
+    echoes the access_token into the "next" URL it returns, so subsequent
+    pages stay authenticated without re-adding it.
     """
     items = []
-    headers = {"Authorization": f"Bearer {access_token}"}
     next_url = url
     next_params = dict(params) if params else {}
+    next_params["access_token"] = access_token
 
     while next_url:
-        resp = request_with_backoff("GET", next_url, params=next_params, headers=headers)
+        resp = request_with_backoff("GET", next_url, params=next_params)
         body = resp.json()
         items.extend(body.get("data", []))
 
         next_url = body.get("paging", {}).get("next")
-        next_params = None  # "next" is a complete URL; don't re-append params
+        next_params = None  # "next" is a complete URL (access_token included); don't re-append params
 
     return items

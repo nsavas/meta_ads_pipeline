@@ -135,6 +135,19 @@ type), then `GET /{system_user_id}/assigned_ad_accounts` lists every ad
 account it's been assigned. No `AD_ACCOUNT_IDS`-equivalent required
 parameter, same auto-discovery-by-default pattern as the Pinterest project.
 
+**The token is sent as an `access_token` query parameter, not an
+`Authorization: Bearer` header.** An earlier version of `meta_http.py` used
+the header, which produced HTTP 400 errors on every call. Every example in
+Meta's own docs (the general Graph API guide, the Insights guide, and the
+breakdowns reference, all checked on 2026-08-20) uses the query-parameter
+form exclusively -- none show a Bearer header. Meta's Graph API also
+surfaces access-token problems as HTTP 400 (`OAuthException`), not 401,
+which is why a bad-auth failure here looks like a malformed request rather
+than an auth error. If you're debugging a 400 on any job, this is the first
+thing to check -- confirm `access_token` actually appears in the outgoing
+query string (`meta_http.get_all_pages()` and `meta_accounts.get_self_id()`
+are the only two places that attach it).
+
 ## No OpenAPI spec for Meta
 
 Pinterest publishes a real OpenAPI spec on GitHub
@@ -240,3 +253,15 @@ works -- no discriminator column, no double-counting footgun to document.
   fetched reference pages' `datetime` type annotation. Stored as the raw
   string and cast via SQL at merge time, same technique used for
   `stat_date` in every performance job.
+- **`time_range` is interpreted in the ad account's own timezone, not UTC.**
+  Pinterest's `start_date`/`end_date` are explicitly UTC. Meta's Insights API
+  interprets `since`/`until` in whatever timezone the ad account itself is
+  set to -- confirmed while researching the 400-error auth fix above, not
+  something assumed going in. `resolve_date_range()` computes dates off
+  `date.today()` (server/UTC time) the same way the Pinterest jobs do, so an
+  ad account running in a non-UTC timezone will see its "yesterday" boundary
+  shift by the timezone offset relative to what this job actually requests.
+  Not a correctness bug for a 14-day rolling window -- a day or so of skew
+  at the edges of the window self-corrects on the next run via the `MERGE
+  INTO` -- but worth knowing if you need exact per-account-timezone-day
+  alignment.

@@ -32,8 +32,7 @@ def get_self_id(access_token: str) -> str:
     resp = request_with_backoff(
         "GET",
         f"{GRAPH_API_BASE}/me",
-        params={"fields": "id"},
-        headers={"Authorization": f"Bearer {access_token}"},
+        params={"fields": "id", "access_token": access_token},
     )
     return resp.json()["id"]
 
