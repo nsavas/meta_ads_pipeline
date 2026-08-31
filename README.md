@@ -240,7 +240,7 @@ complaining about.
 ## The dimensions job's 500 error, and why it's page-size, not data or auth
 
 Root cause, found live in production on 2026-08-20: requesting the full
-39-64-field object for `DEFAULT_PAGE_SIZE` (100) entities per page, across
+39-62-field object for `DEFAULT_PAGE_SIZE` (100) entities per page, across
 every page of an account with 100+ campaigns, trips Meta's Marketing API
 cost-based throttle. Meta's own message: **"Please reduce the amount of data
 you're asking for, then retry your request."** Confirmed by reproducing it
@@ -271,6 +271,25 @@ don't stack up as fast regardless of page size. If a similarly-large account
 still trips this after both changes, lower `DETAIL_PAGE_SIZE` further before
 assuming something else is wrong -- the mechanism is confirmed, only the
 exact threshold for a given account's data volume is account-specific.
+
+## AdSet's `contextual_bundling_spec` field requires a Gatekeeper flag
+
+A second, unrelated 500 turned up on the ad set dimensions pull after the
+above fix, on accounts with 100+ ad sets. It looked like the same
+cost-based throttle at first, but reproducing the exact `AD_SET_FIELD_SPECS`
+field list directly in Postman (2026-08-30) returned a completely different
+error: **`(#3) AdAccount must pass GK: contextual_bundle_test_api_accounts`**
+-- a permission/feature-gate exception, not a throttle. `contextual_bundling_spec`
+is documented on Meta's AdSet object reference, but it's gated behind a
+Gatekeeper flag that only accounts enrolled in that specific beta program
+have; requesting it for any other account fails outright, no matter the
+page size or pacing.
+
+Fix: `contextual_bundling_spec` was dropped from
+`meta_dimensions_to_iceberg_glue_job.py`'s `AD_SET_FIELD_SPECS` (62 fields
+now, not 63) -- there's no way to request it unconditionally for every
+account. If your accounts are confirmed enrolled in that program, it can be
+added back; see the field-spec comment in that job for the one-line change.
 
 ## Differences from the Pinterest pipeline
 

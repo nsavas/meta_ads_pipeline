@@ -15,7 +15,7 @@ DEFAULT_PAGE_SIZE = 100
 
 # Page size for *full-object* listings -- meta_dimensions_to_iceberg_glue_job.py's
 # three list_entities() calls, which request every field on the Campaign
-# (39 fields), AdSet (64), and Ad (39) objects, several of which are
+# (39 fields), AdSet (62), and Ad (39) objects, several of which are
 # non-trivial nested objects (promoted_object, issues_info, source_campaign,
 # targeting, creative, ...). Confirmed in production (2026-08-20) that
 # requesting DEFAULT_PAGE_SIZE (100) full objects per page, across every

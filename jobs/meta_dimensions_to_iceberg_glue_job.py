@@ -50,7 +50,19 @@ Design notes:
   built from Meta's live Graph API reference docs
   (https://developers.facebook.com/docs/marketing-api/reference/ad-campaign-group/,
   .../ad-campaign/, .../adgroup/) fetched on 2026-08-19: Campaign (39
-  fields), AdSet (64 fields), Ad (39 fields).
+  fields), AdSet (62 fields -- see note below on the one field dropped), Ad
+  (39 fields).
+- AdSet's `contextual_bundling_spec` field is deliberately excluded, even
+  though it's documented on the AdSet object reference. Confirmed in
+  production (2026-08-30) that requesting it returns Meta error (#3)
+  "AdAccount must pass GK: contextual_bundle_test_api_accounts" -- it's
+  gated behind a Gatekeeper flag only accounts enrolled in that specific
+  beta program have, and most ad accounts (including the one this was
+  diagnosed against) aren't enrolled. This is a hard permission failure,
+  not a retryable error, so there's no reasonable way to request it
+  unconditionally for every account. If you know your accounts *are*
+  enrolled in that program, add `("contextual_bundling_spec",
+  "contextual_bundling_spec_json", "json")` back into AD_SET_FIELD_SPECS.
 - Every scalar field (string/int/bool/number) becomes its own typed column.
   Every nested object, list, or map-typed field (`targeting`, `promoted_object`,
   `adlabels`, `bid_info`, `creative`, etc.) is serialized to a `..._json`
@@ -84,13 +96,13 @@ SCHEMA / ICEBERG_COLUMNS / the row-builder for each entity are derived from
 one field-spec list via common/meta_schema.py's build_table(), rather than
 three hand-written, independently-maintained lists (as the Pinterest
 project's dimensions job does) -- deliberate, given these entities have
-39-64 fields each, larger than anything in the sibling project. Keeping one
+39-62 fields each, larger than anything in the sibling project. Keeping one
 list per entity as the single source of truth makes a transposition bug (a
 column landing under the wrong name) structurally impossible rather than
 something to catch by testing afterwards.
 
 Requests every entity at meta_config.DETAIL_PAGE_SIZE (25) per page, not the
-default 100 -- confirmed in production that requesting the full 39-64-field
+default 100 -- confirmed in production that requesting the full 39-62-field
 object for 100 entities per page, across every page of a 100+-campaign
 account, trips Meta's cost-based throttle ("Please reduce the amount of data
 you're asking for"), returned as an HTTP 500 that a same-request retry
@@ -169,7 +181,8 @@ CAMPAIGN_FIELD_SPECS = [
 ]
 
 # --------------------------------------------------------------------------
-# AdSet fields (64, from Meta's AdSet object reference)
+# AdSet fields (62, from Meta's AdSet object reference -- excludes
+# contextual_bundling_spec, see module docstring's note on that field)
 # --------------------------------------------------------------------------
 AD_SET_FIELD_SPECS = [
     ("id", "ad_set_id", "string"),
@@ -190,7 +203,6 @@ AD_SET_FIELD_SPECS = [
     ("campaign_attribution", "campaign_attribution", "string"),
     ("campaign_id", "campaign_id", "string"),
     ("configured_status", "configured_status", "string"),
-    ("contextual_bundling_spec", "contextual_bundling_spec_json", "json"),
     ("created_time", "created_time", "timestamp"),
     ("creative_sequence", "creative_sequence_json", "json"),
     ("daily_budget", "daily_budget", "double"),
