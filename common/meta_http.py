@@ -2,10 +2,14 @@
 
 Same retry contract as the Pinterest pipeline's http helper (429 honoring
 Retry-After, 5xx backoff) for consistency across both projects. Meta's Graph
-API returns errors in a JSON body ({"error": {"message", "code", ...}}) with
-a 4xx/5xx status in the common cases this handles, so raise_for_status()
-still does the right thing; a caller that needs the structured error message
-should catch requests.HTTPError and inspect resp.json()["error"].
+API returns errors in a JSON body ({"error": {"message", "code",
+"error_subcode", "error_user_msg", "fbtrace_id"}}) even for a bare 500 --
+but requests' default HTTPError message (raise_for_status()'s
+"500 Server Error: Internal Server Error for url: ...") never includes that
+body, so the actual reason gets silently discarded unless something goes
+looking for it. describe_meta_error()/the raise in request_with_backoff()
+below attach it to the exception message instead, so a job's traceback shows
+Meta's real message/code/fbtrace_id, not just the generic HTTP reason phrase.
 """
 
 import logging
@@ -13,9 +17,45 @@ import time
 
 import requests
 
-from meta_config import INITIAL_BACKOFF_SECONDS, MAX_RETRIES
+from meta_config import INITIAL_BACKOFF_SECONDS, MAX_RETRIES, PAGE_PACING_SECONDS
 
 logger = logging.getLogger(__name__)
+
+
+def describe_meta_error(resp: requests.Response) -> str:
+    """Extract Meta's structured error detail from a response body, if any.
+    Returns "" if the body isn't JSON or has no "error" object (e.g. a
+    plain-text 5xx from an intermediate proxy rather than Meta's API itself).
+    """
+    try:
+        err = resp.json().get("error")
+    except ValueError:
+        return ""
+    if not err:
+        return ""
+
+    parts = []
+    if err.get("message"):
+        parts.append(err["message"])
+    if err.get("error_user_msg"):
+        parts.append(f"user_message={err['error_user_msg']}")
+    if err.get("type"):
+        parts.append(f"type={err['type']}")
+    if err.get("code") is not None:
+        parts.append(f"code={err['code']}")
+    if err.get("error_subcode") is not None:
+        parts.append(f"error_subcode={err['error_subcode']}")
+    if err.get("fbtrace_id"):
+        parts.append(f"fbtrace_id={err['fbtrace_id']}")
+    return " | Meta error: " + ", ".join(parts) if parts else ""
+
+
+def _raise_with_detail(resp: requests.Response) -> None:
+    detail = describe_meta_error(resp)
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError as e:
+        raise requests.HTTPError(str(e) + detail, response=resp) from None
 
 
 def request_with_backoff(method: str, url: str, params: dict = None,
@@ -24,8 +64,9 @@ def request_with_backoff(method: str, url: str, params: dict = None,
                           **kwargs) -> requests.Response:
     """requests.request() with retry on 429 (honoring Retry-After) and 5xx.
 
-    Raises via resp.raise_for_status() for any other error status, and after
-    exhausting max_retries.
+    Raises (with Meta's structured error detail appended -- see
+    describe_meta_error()) for any other error status, and after exhausting
+    max_retries.
     """
     backoff = initial_backoff
     resp = None
@@ -33,20 +74,20 @@ def request_with_backoff(method: str, url: str, params: dict = None,
         resp = requests.request(method, url, params=params, timeout=60, **kwargs)
         if resp.status_code == 429:
             retry_after = int(resp.headers.get("Retry-After", backoff))
-            logger.warning("Rate limited by Meta Graph API, sleeping %ss (attempt %s/%s)",
-                            retry_after, attempt, max_retries)
+            logger.warning("Rate limited by Meta Graph API, sleeping %ss (attempt %s/%s)%s",
+                            retry_after, attempt, max_retries, describe_meta_error(resp))
             time.sleep(retry_after)
             backoff *= 2
             continue
         if resp.status_code >= 500:
-            logger.warning("Meta Graph API %s error, retrying in %ss (attempt %s/%s)",
-                            resp.status_code, backoff, attempt, max_retries)
+            logger.warning("Meta Graph API %s error, retrying in %ss (attempt %s/%s)%s",
+                            resp.status_code, backoff, attempt, max_retries, describe_meta_error(resp))
             time.sleep(backoff)
             backoff *= 2
             continue
-        resp.raise_for_status()
+        _raise_with_detail(resp)
         return resp
-    resp.raise_for_status()  # last attempt's error, if we fell through
+    _raise_with_detail(resp)  # last attempt's error, if we fell through
     return resp
 
 
@@ -69,6 +110,13 @@ def get_all_pages(url: str, params: dict, access_token: str) -> list:
     page -- a short final page can still carry a cursors object. Meta
     echoes the access_token into the "next" URL it returns, so subsequent
     pages stay authenticated without re-adding it.
+
+    Pauses PAGE_PACING_SECONDS between pages (not before the first request,
+    and not after the last one) -- confirmed in production that firing
+    consecutive full-object page requests back-to-back with no pacing can
+    trip Meta's Marketing API cost-based throttle ("Please reduce the amount
+    of data you're asking for"), which comes back as an HTTP 500 that a
+    same-request retry does not fix.
     """
     items = []
     next_url = url
@@ -82,5 +130,8 @@ def get_all_pages(url: str, params: dict, access_token: str) -> list:
 
         next_url = body.get("paging", {}).get("next")
         next_params = None  # "next" is a complete URL (access_token included); don't re-append params
+
+        if next_url:
+            time.sleep(PAGE_PACING_SECONDS)
 
     return items

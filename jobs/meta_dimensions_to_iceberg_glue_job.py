@@ -88,6 +88,15 @@ project's dimensions job does) -- deliberate, given these entities have
 list per entity as the single source of truth makes a transposition bug (a
 column landing under the wrong name) structurally impossible rather than
 something to catch by testing afterwards.
+
+Requests every entity at meta_config.DETAIL_PAGE_SIZE (25) per page, not the
+default 100 -- confirmed in production that requesting the full 39-64-field
+object for 100 entities per page, across every page of a 100+-campaign
+account, trips Meta's cost-based throttle ("Please reduce the amount of data
+you're asking for"), returned as an HTTP 500 that a same-request retry
+doesn't fix. This job is the one place in the project pulling that much data
+per object; the ID-only calls the performance jobs make stay at the default
+page size. See meta_config.py's DETAIL_PAGE_SIZE docstring for the full story.
 """
 
 import os
@@ -101,6 +110,7 @@ from awsglue.job import Job
 from pyspark.context import SparkContext
 
 from meta_accounts import list_entities, resolve_ad_account_ids
+from meta_config import DETAIL_PAGE_SIZE
 from meta_auth import get_access_token
 from meta_glue_args import resolve_args
 from meta_iceberg import replace_table
@@ -333,11 +343,16 @@ def main():
 
     campaign_rows, ad_set_rows, ad_rows = [], [], []
     for ad_account_id in ad_account_ids:
-        for c in list_entities(ad_account_id, access_token, "campaigns", CAMPAIGN_API_FIELDS):
+        for c in list_entities(ad_account_id, access_token, "campaigns", CAMPAIGN_API_FIELDS,
+                                page_size=DETAIL_PAGE_SIZE):
             campaign_rows.append(campaign_to_row(ad_account_id, c, ingested_at))
-        for a in list_entities(ad_account_id, access_token, "adsets", AD_SET_API_FIELDS):
+
+        for a in list_entities(ad_account_id, access_token, "adsets", AD_SET_API_FIELDS,
+                                page_size=DETAIL_PAGE_SIZE):
             ad_set_rows.append(ad_set_to_row(ad_account_id, a, ingested_at))
-        for a in list_entities(ad_account_id, access_token, "ads", AD_API_FIELDS):
+
+        for a in list_entities(ad_account_id, access_token, "ads", AD_API_FIELDS,
+                                page_size=DETAIL_PAGE_SIZE):
             ad_rows.append(ad_to_row(ad_account_id, a, ingested_at))
 
     logger.info("Fetched %d campaign(s), %d ad set(s), %d ad(s) across %d account(s)",

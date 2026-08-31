@@ -57,7 +57,8 @@ def list_ad_accounts(access_token: str) -> list:
     return accounts
 
 
-def list_entities(ad_account_id: str, access_token: str, entity_path: str, fields: list) -> list:
+def list_entities(ad_account_id: str, access_token: str, entity_path: str, fields: list,
+                   page_size: int = DEFAULT_PAGE_SIZE) -> list:
     """Page through /{ad_account_id}/{entity_path} collecting the full
     entity object (whichever fields were requested) for every entity in
     the account.
@@ -66,10 +67,15 @@ def list_entities(ad_account_id: str, access_token: str, entity_path: str, field
     entity_path: "campaigns", "adsets", or "ads".
     fields: list of field names to request -- Meta has no "return everything"
       default, unlike Pinterest's list endpoints.
+    page_size: defaults to DEFAULT_PAGE_SIZE (100), fine for the ID-only
+      calls list_entity_ids() makes. Callers requesting many/wide fields per
+      object (see meta_dimensions_to_iceberg_glue_job.py) should pass
+      meta_config.DETAIL_PAGE_SIZE instead -- see that constant's docstring
+      for why (Meta's cost-based throttle on large full-object pages).
     """
     items = get_all_pages(
         f"{GRAPH_API_BASE}/{ad_account_id}/{entity_path}",
-        {"fields": ",".join(fields), "limit": DEFAULT_PAGE_SIZE},
+        {"fields": ",".join(fields), "limit": page_size},
         access_token,
     )
     logger.info("Ad account %s: found %d %s", ad_account_id, len(items), entity_path)

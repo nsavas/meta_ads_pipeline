@@ -218,6 +218,60 @@ requests both in one call and writes one table with grain
 `(age, gender)` pair, so `SUM(spend)` for an `(ad_id, stat_date)` just
 works -- no discriminator column, no double-counting footgun to document.
 
+## Meta's error detail is preserved in raised errors
+
+Every job loops over every discovered ad account and makes at least one API
+call per account; a single account's request error (a 500, a timeout, a
+permission problem -- anything `requests` raises) propagates straight out
+of `main()` and aborts the run, the same way an unhandled exception would
+anywhere else in the pipeline.
+
+What *is* handled is the quality of that error's message. `requests`'
+default `HTTPError` message (`"500 Server Error: Internal Server Error for
+url: ..."`) never includes the response body, but Meta's Graph API almost
+always returns a structured `{"error": {"message", "code", "error_subcode",
+"fbtrace_id", ...}}` JSON payload even on a 500. `meta_http.py`'s
+`describe_meta_error()` extracts that and appends it to whatever gets
+raised, so a job's logs/traceback show Meta's actual message and
+`fbtrace_id` instead of just the generic HTTP reason phrase -- the
+difference between "500 Server Error" and knowing what Meta is actually
+complaining about.
+
+## The dimensions job's 500 error, and why it's page-size, not data or auth
+
+Root cause, found live in production on 2026-08-20: requesting the full
+39-64-field object for `DEFAULT_PAGE_SIZE` (100) entities per page, across
+every page of an account with 100+ campaigns, trips Meta's Marketing API
+cost-based throttle. Meta's own message: **"Please reduce the amount of data
+you're asking for, then retry your request."** Confirmed by reproducing it
+directly: the identical request succeeded once in Postman, then failed with
+that exact message on an immediate re-run of the same request. That rules out
+a data problem with a specific campaign, a permissions problem, and a
+query-format problem -- three hypotheses chased and eliminated in that order
+before this one:
+1. **Not auth** -- same System User token in Postman and the job.
+2. **Not the field list** -- Postman succeeded requesting all 39 fields,
+   `budget_rebalance_flag` (a field flagged deprecated since Marketing API
+   v7.0) included.
+3. **Not a specific bad record on a later page** -- the failure reproduced
+   on the *same* request run twice, not on a *different* page/cursor.
+4. **Is a request-cost throttle** -- confirmed by Meta's own error message,
+   which explicitly asks for less data per request, not a retry of the same
+   request. This is also why `request_with_backoff()`'s retry-with-backoff
+   didn't help on its own: it retries the identical request, which is
+   exactly what Meta's message says not to do.
+
+Fix: `meta_config.DETAIL_PAGE_SIZE` (25, vs. the default 100) for
+`meta_dimensions_to_iceberg_glue_job.py`'s three full-object listings only --
+the performance jobs' ID-only/insights calls stay at the default, since
+they're far cheaper per object and weren't implicated. `get_all_pages()`
+also now pauses `PAGE_PACING_SECONDS` (1s) between pages (not before the
+first or after the last) on every paginated call, so consecutive requests
+don't stack up as fast regardless of page size. If a similarly-large account
+still trips this after both changes, lower `DETAIL_PAGE_SIZE` further before
+assuming something else is wrong -- the mechanism is confirmed, only the
+exact threshold for a given account's data volume is account-specific.
+
 ## Differences from the Pinterest pipeline
 
 - **Auth**: static System User token, no refresh flow (see "Auth" above).
