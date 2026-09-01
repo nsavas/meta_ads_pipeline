@@ -51,7 +51,8 @@ Design notes:
   (https://developers.facebook.com/docs/marketing-api/reference/ad-campaign-group/,
   .../ad-campaign/, .../adgroup/) fetched on 2026-08-19: Campaign (39
   fields), AdSet (62 fields -- see note below on the one field dropped), Ad
-  (39 fields).
+  (34 fields -- see notes below on the permission-gated field dropped and
+  the four heavy nested-object fields trimmed for request cost).
 - AdSet's `contextual_bundling_spec` field is deliberately excluded, even
   though it's documented on the AdSet object reference. Confirmed in
   production (2026-08-30) that requesting it returns Meta error (#3)
@@ -63,6 +64,36 @@ Design notes:
   unconditionally for every account. If you know your accounts *are*
   enrolled in that program, add `("contextual_bundling_spec",
   "contextual_bundling_spec_json", "json")` back into AD_SET_FIELD_SPECS.
+- Ad's `special_ad_categories` field is likewise deliberately excluded.
+  Confirmed in production (2026-08-30), isolated via field-list bisection
+  in Postman: requesting it returns Meta error (#3) "App must be on the
+  whitelist" -- a different gate than AdSet's (this one's tied to Meta's
+  Special Ad Category program for housing/employment/credit/social-issue
+  ads, which requires separate app review), but the same practical result:
+  a hard permission failure for any app not enrolled, unconditionally
+  across every account. `creative_asset_groups_spec` was also suspected
+  during this investigation (it's the newest/most beta-flavored field on
+  the Ad object) but confirmed clean -- it's requested normally. If your
+  app is confirmed enrolled in the Special Ad Category program, add
+  `("special_ad_categories", "special_ad_categories_json", "json")` back
+  into AD_FIELD_SPECS.
+- Ad's `targeting`, `tracking_and_conversion_with_defaults`, `tracking_specs`,
+  and `issues_info` fields are deliberately trimmed too, but for a different
+  reason than the two above -- these aren't permission-gated, they're just
+  large/deeply-nested objects, and on accounts with 5,500+ ads (confirmed in
+  production, 2026-08-30) even meta_config.DETAIL_PAGE_SIZE (25) wasn't
+  enough to avoid recurring cost-based throttle 500s (the same "Please
+  reduce the amount of data you're asking for" throttle documented below).
+  Trimming these four cuts the actual data weight of every page, unlike
+  lowering DETAIL_PAGE_SIZE further, which only redistributes the *same*
+  total cost across more requests -- for an account this large, the
+  throttle behaves like a time-windowed cost budget on total data pulled
+  (see the original 500 diagnosis: an identical request succeeded once,
+  then failed instantly on an immediate retry), so cutting payload weight
+  is the lever that actually reduces total cost rather than just spreading
+  it out. If you need any of these four for downstream analysis, consider a
+  narrower follow-up call to the specific ad's own edge instead of carrying
+  them on every row of a 5,500+-row full-account pull.
 - Every scalar field (string/int/bool/number) becomes its own typed column.
   Every nested object, list, or map-typed field (`targeting`, `promoted_object`,
   `adlabels`, `bid_info`, `creative`, etc.) is serialized to a `..._json`
@@ -96,13 +127,13 @@ SCHEMA / ICEBERG_COLUMNS / the row-builder for each entity are derived from
 one field-spec list via common/meta_schema.py's build_table(), rather than
 three hand-written, independently-maintained lists (as the Pinterest
 project's dimensions job does) -- deliberate, given these entities have
-39-62 fields each, larger than anything in the sibling project. Keeping one
+34-62 fields each, larger than anything in the sibling project. Keeping one
 list per entity as the single source of truth makes a transposition bug (a
 column landing under the wrong name) structurally impossible rather than
 something to catch by testing afterwards.
 
 Requests every entity at meta_config.DETAIL_PAGE_SIZE (25) per page, not the
-default 100 -- confirmed in production that requesting the full 39-62-field
+default 100 -- confirmed in production that requesting the full 34-62-field
 object for 100 entities per page, across every page of a 100+-campaign
 account, trips Meta's cost-based throttle ("Please reduce the amount of data
 you're asking for"), returned as an HTTP 500 that a same-request retry
@@ -250,7 +281,11 @@ AD_SET_FIELD_SPECS = [
 ]
 
 # --------------------------------------------------------------------------
-# Ad fields (39, from Meta's Ad object reference)
+# Ad fields (34, from Meta's Ad object reference -- excludes
+# special_ad_categories (permission-gated) and targeting/
+# tracking_and_conversion_with_defaults/tracking_specs/issues_info
+# (trimmed for request cost on large accounts), see module docstring's
+# notes on those fields)
 # --------------------------------------------------------------------------
 AD_FIELD_SPECS = [
     ("id", "ad_id", "string"),
@@ -278,7 +313,6 @@ AD_FIELD_SPECS = [
     ("engagement_audience", "engagement_audience", "boolean"),
     ("failed_delivery_checks", "failed_delivery_checks_json", "json"),
     ("is_autobid", "is_autobid", "boolean"),
-    ("issues_info", "issues_info_json", "json"),
     ("last_updated_by_app_id", "last_updated_by_app_id", "string"),
     ("name", "name", "string"),
     ("preview_shareable_link", "preview_shareable_link", "string"),
@@ -286,11 +320,7 @@ AD_FIELD_SPECS = [
     ("recommendations", "recommendations_json", "json"),
     ("source_ad", "source_ad_json", "json"),
     ("source_ad_id", "source_ad_id", "string"),
-    ("special_ad_categories", "special_ad_categories_json", "json"),
     ("status", "status", "string"),
-    ("targeting", "targeting_json", "json"),
-    ("tracking_and_conversion_with_defaults", "tracking_and_conversion_with_defaults_json", "json"),
-    ("tracking_specs", "tracking_specs_json", "json"),
     ("updated_time", "updated_time", "timestamp"),
 ]
 

@@ -17,7 +17,7 @@ import time
 
 import requests
 
-from meta_config import INITIAL_BACKOFF_SECONDS, MAX_RETRIES, PAGE_PACING_SECONDS
+from meta_config import INITIAL_BACKOFF_SECONDS, MAX_RETRIES
 
 logger = logging.getLogger(__name__)
 
@@ -110,13 +110,6 @@ def get_all_pages(url: str, params: dict, access_token: str) -> list:
     page -- a short final page can still carry a cursors object. Meta
     echoes the access_token into the "next" URL it returns, so subsequent
     pages stay authenticated without re-adding it.
-
-    Pauses PAGE_PACING_SECONDS between pages (not before the first request,
-    and not after the last one) -- confirmed in production that firing
-    consecutive full-object page requests back-to-back with no pacing can
-    trip Meta's Marketing API cost-based throttle ("Please reduce the amount
-    of data you're asking for"), which comes back as an HTTP 500 that a
-    same-request retry does not fix.
     """
     items = []
     next_url = url
@@ -130,8 +123,5 @@ def get_all_pages(url: str, params: dict, access_token: str) -> list:
 
         next_url = body.get("paging", {}).get("next")
         next_params = None  # "next" is a complete URL (access_token included); don't re-append params
-
-        if next_url:
-            time.sleep(PAGE_PACING_SECONDS)
 
     return items

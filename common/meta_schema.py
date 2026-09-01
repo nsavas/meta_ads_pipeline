@@ -3,7 +3,7 @@ function from one field-spec list, so a table's column set has exactly one
 source of truth instead of three hand-written, independently-maintained
 lists that can drift out of alignment with each other.
 
-Used by every job in jobs/ -- both the dimension tables (39-62 fields per
+Used by every job in jobs/ -- both the dimension tables (34-62 fields per
 entity) and the performance tables, where it's the mechanism for turning
 "what fields to pull" (a business decision, kept duplicated per job -- see
 each job's own field-spec list and its comments) into the three parallel

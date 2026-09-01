@@ -15,28 +15,25 @@ DEFAULT_PAGE_SIZE = 100
 
 # Page size for *full-object* listings -- meta_dimensions_to_iceberg_glue_job.py's
 # three list_entities() calls, which request every field on the Campaign
-# (39 fields), AdSet (62), and Ad (39) objects, several of which are
+# (39 fields), AdSet (62), and Ad (34) objects, several of which are
 # non-trivial nested objects (promoted_object, issues_info, source_campaign,
 # targeting, creative, ...). Confirmed in production (2026-08-20) that
 # requesting DEFAULT_PAGE_SIZE (100) full objects per page, across every
-# page of a 100+ campaign account with no pacing between requests, triggers
-# Meta's Marketing API cost-based throttle: "Please reduce the amount of
-# data you're asking for, then retry your request" -- returned as an HTTP
-# 500, not a 429, and NOT resolved by simply retrying the same request (the
-# retry logic in meta_http.py backs off and retries, but Meta is asking for
-# a smaller request, not just a later one). A single request for this
-# account succeeded once, then failed identically on an immediate retry --
-# confirming this is a request-cost throttle, not a data/permissions issue
-# with a specific campaign. Keep this well below DEFAULT_PAGE_SIZE.
+# page of a 100+ campaign account, triggers Meta's Marketing API cost-based
+# throttle: "Please reduce the amount of data you're asking for, then retry
+# your request" -- returned as an HTTP 500, not a 429, and NOT resolved by
+# simply retrying the same request (the retry logic in meta_http.py backs
+# off and retries, but Meta is asking for a smaller request, not just a
+# later one). A single request for this account succeeded once, then
+# failed identically on an immediate retry -- confirming this is a
+# request-cost throttle, not a data/permissions issue with a specific
+# campaign. Keep this well below DEFAULT_PAGE_SIZE. On very large accounts
+# (5,500+ ads), this alone wasn't enough -- see
+# meta_dimensions_to_iceberg_glue_job.py's note on the heavy nested fields
+# trimmed from AD_FIELD_SPECS, which is what actually resolved it there:
+# the throttle behaves like a budget on total data pulled, so a smaller
+# page size only spreads the same total cost across more requests.
 DETAIL_PAGE_SIZE = 25
-
-# Pause between successive pages during pagination (get_all_pages() in
-# meta_http.py), so consecutive full-object requests don't stack up and
-# accumulate query cost as fast as they would back-to-back. Applied to every
-# multi-page pull, not just the dimensions job's -- harmless extra latency
-# for the cheap ID-only/insights pulls, meaningful headroom for the
-# expensive ones.
-PAGE_PACING_SECONDS = 1
 
 # Default width of the rolling incremental pull when a job isn't given
 # explicit START_DATE/END_DATE. See meta_dates.py for why 14 days.

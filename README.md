@@ -240,7 +240,7 @@ complaining about.
 ## The dimensions job's 500 error, and why it's page-size, not data or auth
 
 Root cause, found live in production on 2026-08-20: requesting the full
-39-62-field object for `DEFAULT_PAGE_SIZE` (100) entities per page, across
+34-62-field object for `DEFAULT_PAGE_SIZE` (100) entities per page, across
 every page of an account with 100+ campaigns, trips Meta's Marketing API
 cost-based throttle. Meta's own message: **"Please reduce the amount of data
 you're asking for, then retry your request."** Confirmed by reproducing it
@@ -264,13 +264,22 @@ before this one:
 Fix: `meta_config.DETAIL_PAGE_SIZE` (25, vs. the default 100) for
 `meta_dimensions_to_iceberg_glue_job.py`'s three full-object listings only --
 the performance jobs' ID-only/insights calls stay at the default, since
-they're far cheaper per object and weren't implicated. `get_all_pages()`
-also now pauses `PAGE_PACING_SECONDS` (1s) between pages (not before the
-first or after the last) on every paginated call, so consecutive requests
-don't stack up as fast regardless of page size. If a similarly-large account
-still trips this after both changes, lower `DETAIL_PAGE_SIZE` further before
-assuming something else is wrong -- the mechanism is confirmed, only the
-exact threshold for a given account's data volume is account-specific.
+they're far cheaper per object and weren't implicated.
+
+If a much larger account still trips this after that change (confirmed at
+5,500+ ads -- see "Ad's heavy nested fields are trimmed" below), don't reach
+for `DETAIL_PAGE_SIZE` first: the throttle behaves like a time-windowed cost
+budget on *total* data pulled, not a flat per-request cap, so shrinking the
+page size further just redistributes the same total cost across more
+requests rather than reducing it -- and at large enough page counts, more
+requests means more wall-clock time for no real benefit (5,500+ ads at
+`DETAIL_PAGE_SIZE=25` is already 220+ pages). Trimming which fields are
+actually requested is the lever that reduces total cost. (An earlier version
+of this fix also added a fixed pause between pages, `PAGE_PACING_SECONDS`;
+it was removed once the field-trimming fix below addressed the underlying
+cost directly -- a fixed per-page sleep doesn't scale well against accounts
+with hundreds of pages, and running the day-to-day retry/backoff loop
+already absorbs the occasional throttle without a constant tax on every run.)
 
 ## AdSet's `contextual_bundling_spec` field requires a Gatekeeper flag
 
@@ -290,6 +299,61 @@ Fix: `contextual_bundling_spec` was dropped from
 now, not 63) -- there's no way to request it unconditionally for every
 account. If your accounts are confirmed enrolled in that program, it can be
 added back; see the field-spec comment in that job for the one-line change.
+
+## Ad's `special_ad_categories` field requires separate app review
+
+A third gated field, same shape as the two above: the ad dimensions pull
+also started failing on accounts with 100+ ads, this time with
+**`(#3) App must be on the whitelist`**. Meta's error gives no field name,
+so this one was isolated by bisecting `AD_FIELD_SPECS` in Postman --
+repeatedly halving the field list and testing each half until a single
+field remained: `special_ad_categories`. It's tied to Meta's Special Ad
+Category program (required for housing/employment/credit/social-issue ads),
+which gates API access behind separate app review, independent of the
+Gatekeeper mechanism behind AdSet's `contextual_bundling_spec`. Same
+practical effect either way: a hard permission failure for any
+non-enrolled app, unconditionally across every account.
+
+`creative_asset_groups_spec` was also suspected during this investigation
+(it's the newest/most beta-flavored field on the Ad object, and the closest
+parallel to `contextual_bundling_spec`) but was confirmed clean by testing
+it removed-alone (still failed) and then included-alongside every other
+field with only `special_ad_categories` also removed (succeeded) -- it's
+requested normally.
+
+Fix: `special_ad_categories` was dropped from
+`meta_dimensions_to_iceberg_glue_job.py`'s `AD_FIELD_SPECS` (38 fields now,
+not 39). If your app is confirmed enrolled in the Special Ad Category
+program, it can be added back; see the field-spec comment in that job for
+the one-line change.
+
+## Ad's heavy nested fields are trimmed to cut request cost
+
+Once the two gated fields above were removed, the dimensions job still
+recurringly hit the cost-based throttle (the same 500, "Please reduce the
+amount of data you're asking for") on the largest accounts -- 5,500+ ads,
+confirmed in production on 2026-08-30 -- even at `DETAIL_PAGE_SIZE` (25).
+Unlike the campaign/ad-set case, the fix here isn't a smaller page size or
+more pacing: at that scale (220+ pages just for the ads pull on one such
+account), either change trades reliability for a lot of extra wall-clock
+time without addressing the actual problem -- the throttle looks like a
+time-windowed budget on *total* data pulled, and total data pulled doesn't
+change just because it's split into more/slower requests.
+
+The lever that actually helps is cutting the payload itself.
+`targeting`, `tracking_and_conversion_with_defaults`, `tracking_specs`, and
+`issues_info` were dropped from `AD_FIELD_SPECS` -- they're not
+permission-gated like `special_ad_categories`, just large/deeply-nested
+objects that add real weight to every row of a full-account pull. `targeting`
+in particular can be a substantial object (geo, interest, behavior, custom
+audience targeting all nested together). None of the four are needed for
+the current use case; if you need one later, consider a narrower per-ad
+follow-up call instead of carrying it on every row of a 5,500+-row pull.
+
+Fix: those four fields were dropped from
+`meta_dimensions_to_iceberg_glue_job.py`'s `AD_FIELD_SPECS` (34 fields now,
+not 38). See the field-spec comment in that job to add any back if a future
+use case needs one -- just be aware of the cost tradeoff on large accounts.
 
 ## Differences from the Pinterest pipeline
 
