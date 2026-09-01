@@ -369,10 +369,14 @@ docs before implementing that those two only scope computed stats fields
 on this edge, not which objects come back. The Marketing API's `filtering`
 parameter is the one that actually filters returned entities: each call now
 sends `filtering=[{"field": "<entity>.created_time", "operator":
-"GREATER_THAN_OR_EQUAL", "value": <epoch>}, ...]` (and the LESS_THAN_OR_EQUAL
-counterpart for the window's end), built by `_created_time_filter()` in the
-job. **The exact field-name convention (`"campaign.created_time"` /
-`"adset.created_time"` / `"ad.created_time"`) is based on community/SDK
+"GREATER_THAN", "value": <epoch - 1>}, ...]` (and the LESS_THAN counterpart,
+`+1`, for the window's end), built by `_created_time_filter()` in the job.
+Uses strict `GREATER_THAN`/`LESS_THAN`, not `_OR_EQUAL` -- confirmed in
+production (2026-09-01) that `GREATER_THAN_OR_EQUAL` is rejected as an
+unsupported operator on this field/edge; the +/-1 second adjustment on the
+boundary values keeps the window inclusive despite the strict operators.
+**The exact field-name convention (`"campaign.created_time"` /
+`"adset.created_time"` / `"ad.created_time"`) is still based on community/SDK
 examples, not Meta's official per-edge reference page** -- confirm on your
 first real run that the filter is actually narrowing results (check the
 fetched counts against what you'd expect) rather than being silently

@@ -409,10 +409,18 @@ def _created_time_filter(entity_type: str, start_ts: int, end_ts: int) -> list:
     entity_type: "campaign", "adset", or "ad" -- matches the field-name
     convention Meta's filtering param is documented (via community/SDK
     examples) to expect: "<entity_type>.created_time".
+
+    Uses strict GREATER_THAN/LESS_THAN, not the _OR_EQUAL variants -- confirmed
+    in production (2026-09-01) that GREATER_THAN_OR_EQUAL is rejected as an
+    unsupported operator on this field/edge, matching real-world examples
+    seen elsewhere (e.g. Node.js SDK usage) that only ever show plain
+    GREATER_THAN/LESS_THAN, never the _OR_EQUAL forms. The +/-1 second
+    adjustment below keeps the boundary values themselves inside the window
+    despite the operators being strict.
     """
     return [
-        {"field": f"{entity_type}.created_time", "operator": "GREATER_THAN_OR_EQUAL", "value": start_ts},
-        {"field": f"{entity_type}.created_time", "operator": "LESS_THAN_OR_EQUAL", "value": end_ts},
+        {"field": f"{entity_type}.created_time", "operator": "GREATER_THAN", "value": start_ts - 1},
+        {"field": f"{entity_type}.created_time", "operator": "LESS_THAN", "value": end_ts + 1},
     ]
 
 
