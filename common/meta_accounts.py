@@ -14,6 +14,7 @@ call -- there's no "just give me everything" default -- so list_entities()
 takes a `fields` argument rather than returning a fixed full object.
 """
 
+import json
 import logging
 
 from meta_config import DEFAULT_PAGE_SIZE, GRAPH_API_BASE
@@ -58,7 +59,7 @@ def list_ad_accounts(access_token: str) -> list:
 
 
 def list_entities(ad_account_id: str, access_token: str, entity_path: str, fields: list,
-                   page_size: int = DEFAULT_PAGE_SIZE) -> list:
+                   page_size: int = DEFAULT_PAGE_SIZE, filtering: list = None) -> list:
     """Page through /{ad_account_id}/{entity_path} collecting the full
     entity object (whichever fields were requested) for every entity in
     the account.
@@ -72,10 +73,20 @@ def list_entities(ad_account_id: str, access_token: str, entity_path: str, field
       object (see meta_dimensions_to_iceberg_glue_job.py) should pass
       meta_config.DETAIL_PAGE_SIZE instead -- see that constant's docstring
       for why (Meta's cost-based throttle on large full-object pages).
+    filtering: optional list of Marketing API filter dicts, e.g.
+      [{"field": "campaign.created_time", "operator": "GREATER_THAN_OR_EQUAL",
+      "value": 1700000000}]. JSON-encoded and sent as the `filtering` query
+      parameter -- this filters which entities are returned by the edge
+      itself (unlike `date_preset`/`time_range`, which only scope computed
+      stats fields and don't affect which objects come back). See
+      meta_dimensions_to_iceberg_glue_job.py's CREATED_TIME filtering notes.
     """
+    params = {"fields": ",".join(fields), "limit": page_size}
+    if filtering:
+        params["filtering"] = json.dumps(filtering)
     items = get_all_pages(
         f"{GRAPH_API_BASE}/{ad_account_id}/{entity_path}",
-        {"fields": ",".join(fields), "limit": page_size},
+        params,
         access_token,
     )
     logger.info("Ad account %s: found %d %s", ad_account_id, len(items), entity_path)

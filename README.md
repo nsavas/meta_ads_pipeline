@@ -95,9 +95,11 @@ in `jobs/` for the full list):
 | `--START_DATE` / `--END_DATE` | no* | explicit backfill range; omit for the rolling incremental window |
 | `--LOOKBACK_DAYS` | no* | default 14; width of the rolling window when dates are omitted |
 
-\* The five performance/breakdown jobs take all three optional args.
-`meta_dimensions_to_iceberg_glue_job.py` takes **none** of them -- it's not
-time-series data, so it only needs the required arguments.
+\* All six jobs take all three optional date args. `meta_dimensions_to_iceberg_glue_job.py`
+started out with none of them (it's not time-series data), but as of
+2026-09-01 it also filters by created_time using this same rolling-window/
+backfill mechanism -- see "created_time filtering + upsert" below for why,
+and for an important backfill note before relying on the default window.
 
 \*\* `meta_dimensions_to_iceberg_glue_job.py` writes three tables in one
 run, so instead of a single `--ICEBERG_TABLE` it takes three:
@@ -354,6 +356,55 @@ Fix: those four fields were dropped from
 `meta_dimensions_to_iceberg_glue_job.py`'s `AD_FIELD_SPECS` (34 fields now,
 not 38). See the field-spec comment in that job to add any back if a future
 use case needs one -- just be aware of the cost tradeoff on large accounts.
+
+## created_time filtering + upsert, not a full snapshot (2026-09-01)
+
+To bound request volume further on very large accounts, the dimensions job
+now filters each entity type by its own `created_time`, using the same
+rolling `LOOKBACK_DAYS` (default 14) / explicit `START_DATE`/`END_DATE`
+mechanism the five performance jobs already use (`meta_dates.resolve_date_range()`).
+This is a genuinely different mechanism from `date_preset`/`time_range`
+(see "The dimensions job's 500 error" above) -- confirmed against Meta's
+docs before implementing that those two only scope computed stats fields
+on this edge, not which objects come back. The Marketing API's `filtering`
+parameter is the one that actually filters returned entities: each call now
+sends `filtering=[{"field": "<entity>.created_time", "operator":
+"GREATER_THAN_OR_EQUAL", "value": <epoch>}, ...]` (and the LESS_THAN_OR_EQUAL
+counterpart for the window's end), built by `_created_time_filter()` in the
+job. **The exact field-name convention (`"campaign.created_time"` /
+`"adset.created_time"` / `"ad.created_time"`) is based on community/SDK
+examples, not Meta's official per-edge reference page** -- confirm on your
+first real run that the filter is actually narrowing results (check the
+fetched counts against what you'd expect) rather than being silently
+ignored by the API.
+
+This forced a second, more consequential change: `meta_dimensions_to_iceberg_glue_job.py`
+used to do a full `CREATE OR REPLACE TABLE` every run specifically so a
+campaign/ad set/ad deleted on Meta's side would disappear from the table
+(see "Ad's heavy nested fields are trimmed" above and the job's own
+docstring history). With created_time filtering in place, a full replace
+every run would instead wipe out every entity *older* than the current
+window -- the opposite failure mode, and a worse one, since it would delete
+rows for entities that are still active. All three tables now use
+`upsert()` (MERGE INTO, same mechanism the performance jobs use) instead.
+
+**This reintroduces the exact problem replace_table() was chosen to solve
+in the first place**: an entity deleted on Meta's side no longer disappears
+from the table -- it lingers with whatever data was captured on its last
+successful pull. Filter on `effective_status`/`configured_status`
+downstream (e.g. exclude `"DELETED"`/`"ARCHIVED"`) if stale entities need
+to be excluded from queries against these tables.
+
+**Backfill warning, read before relying on the default window:** an entity
+created before the current `LOOKBACK_DAYS` window will never be pulled by
+an incremental run, full stop -- unlike the performance jobs' daily metrics
+(which are meaningless before an entity exists but never disappear once
+captured), a campaign/ad set/ad's *existence* is itself time-gated by this
+filter. Run this job at least once with a `START_DATE` far enough back to
+cover every entity you care about (or an equivalently large `LOOKBACK_DAYS`)
+to seed the tables before switching to the incremental default -- otherwise
+an older, still-active entity that no run's window has ever covered will
+simply never appear in these tables.
 
 ## Differences from the Pinterest pipeline
 

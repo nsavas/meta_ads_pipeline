@@ -30,9 +30,14 @@ Optional job parameters:
                                    job discovers every account the System User token has
                                    been assigned in Business Manager. Pass this only to
                                    restrict a run to a subset of accounts (e.g. testing).
+  --START_DATE                    YYYY-MM-DD (inclusive). If omitted, computed from LOOKBACK_DAYS.
+  --END_DATE                      YYYY-MM-DD (inclusive). If omitted, computed from LOOKBACK_DAYS.
+  --LOOKBACK_DAYS                 integer, default 14. Ignored if START_DATE/END_DATE are set.
 
-There's no START_DATE/END_DATE/LOOKBACK_DAYS here -- unlike the performance
-jobs, this isn't time-series data. Each run is a full current-state snapshot.
+Unlike the earlier version of this job, entities ARE now filtered by
+created_time -- see "created_time filtering + upsert, not a full snapshot"
+below for why, and for an important note on backfilling existing entities
+before relying on the default rolling window.
 
 Also pass, at the job level (not in this script):
   --datalake-formats iceberg
@@ -115,13 +120,47 @@ Design notes:
   loop variable (the account we're actually querying), which is the more
   trustworthy source of truth than trusting the field to always round-trip
   correctly.
-- Full CREATE OR REPLACE TABLE per entity type on every run, not an upsert
-  (see meta_iceberg.py's replace_table()). A MERGE-based upsert only ever
-  adds/updates rows; it would never remove a campaign/ad set/ad deleted on
-  Meta's side, so the table would accumulate stale rows forever. All three
-  tables are written once, at the very end, after every account has been
-  fetched -- so a mid-run failure leaves the existing tables completely
-  untouched rather than partially overwritten.
+- **created_time filtering + upsert, not a full snapshot (changed 2026-09-01).**
+  Every list_entities() call now passes a `filtering` param -- Meta's
+  documented mechanism for filtering *which entities an edge returns*
+  (unlike `date_preset`/`time_range`, which only scope computed stats
+  fields and don't affect which objects come back -- confirmed against
+  Meta's docs before using either). Each entity is filtered on its own
+  `created_time` (field name convention "<entity>.created_time", e.g.
+  "campaign.created_time" -- based on community/SDK examples, not the
+  official per-edge reference page, so confirm the filter is actually
+  narrowing results on your first real run rather than being silently
+  ignored) using GREATER_THAN_OR_EQUAL/LESS_THAN_OR_EQUAL against the same
+  START_DATE/END_DATE/LOOKBACK_DAYS window the performance jobs use (see
+  meta_dates.resolve_date_range()), as Unix-epoch-seconds values in UTC.
+  This was added to bound the request volume on very large accounts,
+  parallel to (and compounding with) the field-trimming fix above.
+
+  This forced a second change: since each run now only sees entities
+  *created* within the window, the previous full CREATE OR REPLACE TABLE
+  (see meta_iceberg.py's replace_table()) would wipe out every
+  older-than-window entity's row on every run, even ones still active --
+  the opposite failure mode replace_table() was originally chosen to avoid.
+  All three tables now use upsert() (MERGE INTO, keyed on
+  ad_account_id + the entity's own id) instead. **This reintroduces the
+  problem replace_table() solved**: a campaign/ad set/ad deleted on Meta's
+  side no longer disappears from the table, it lingers with whatever
+  status/fields it had as of its last successful pull. Filter on
+  `effective_status`/`configured_status` downstream (e.g. exclude
+  "DELETED"/"ARCHIVED") if stale entities need to be excluded from queries.
+
+  **Backfill note:** the default LOOKBACK_DAYS (14) window means an entity
+  created before that window will *never* be pulled unless a run's
+  START_DATE/END_DATE happens to cover its creation date. Before relying on
+  the incremental default, run this job at least once with a START_DATE far
+  enough back to cover every entity you care about (or an equivalently
+  large LOOKBACK_DAYS) to seed the tables -- otherwise older, still-active
+  entities created outside every window this job has ever run with will
+  simply never appear.
+
+  Tables are still written once each, at the very end, after every account
+  has been fetched -- so a mid-run failure leaves the existing tables
+  untouched rather than partially merged.
 
 SCHEMA / ICEBERG_COLUMNS / the row-builder for each entity are derived from
 one field-spec list via common/meta_schema.py's build_table(), rather than
@@ -155,8 +194,9 @@ from pyspark.context import SparkContext
 from meta_accounts import list_entities, resolve_ad_account_ids
 from meta_config import DETAIL_PAGE_SIZE
 from meta_auth import get_access_token
+from meta_dates import resolve_date_range
 from meta_glue_args import resolve_args
-from meta_iceberg import replace_table
+from meta_iceberg import upsert
 from meta_schema import build_table
 
 import logging
@@ -332,6 +372,17 @@ CAMPAIGN_API_FIELDS = [f[0] for f in CAMPAIGN_FIELD_SPECS]
 AD_SET_API_FIELDS = [f[0] for f in AD_SET_FIELD_SPECS]
 AD_API_FIELDS = [f[0] for f in AD_FIELD_SPECS]
 
+# Merge keys for upsert() -- each entity's own id is already globally unique
+# in Meta's system, but ad_account_id is included too for consistency with
+# every other job's KEY_COLUMNS convention in this project.
+CAMPAIGN_KEY_COLUMNS = ["ad_account_id", "campaign_id"]
+AD_SET_KEY_COLUMNS = ["ad_account_id", "ad_set_id"]
+AD_KEY_COLUMNS = ["ad_account_id", "ad_id"]
+# All three entities carry created_time, so partition on it uniformly --
+# also the column the created_time filtering below is scoped to, so rows
+# from a given run land in a small number of partitions.
+PARTITION_EXPR = "days(created_time)"
+
 
 # --------------------------------------------------------------------------
 # Main
@@ -348,7 +399,21 @@ REQUIRED_ARGS = [
     "ICEBERG_TABLE_AD_SETS",
     "ICEBERG_TABLE_ADS",
 ]
-OPTIONAL_ARGS = ["AD_ACCOUNT_IDS"]
+OPTIONAL_ARGS = ["AD_ACCOUNT_IDS", "START_DATE", "END_DATE", "LOOKBACK_DAYS"]
+
+
+def _created_time_filter(entity_type: str, start_ts: int, end_ts: int) -> list:
+    """Build a Marketing API `filtering` list scoping `entity_type`'s
+    created_time to [start_ts, end_ts] inclusive, as Unix-epoch-seconds.
+
+    entity_type: "campaign", "adset", or "ad" -- matches the field-name
+    convention Meta's filtering param is documented (via community/SDK
+    examples) to expect: "<entity_type>.created_time".
+    """
+    return [
+        {"field": f"{entity_type}.created_time", "operator": "GREATER_THAN_OR_EQUAL", "value": start_ts},
+        {"field": f"{entity_type}.created_time", "operator": "LESS_THAN_OR_EQUAL", "value": end_ts},
+    ]
 
 
 def main():
@@ -380,51 +445,64 @@ def main():
         job.commit()
         return
 
-    logger.info("Pulling Meta campaign/ad set/ad dimensions across %d account(s)", len(ad_account_ids))
+    start_date, end_date = resolve_date_range(args)
+    start_ts = int(datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp())
+    end_ts = int(datetime.strptime(end_date, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()) + 86399
+    logger.info("Pulling Meta campaign/ad set/ad dimensions created %s..%s across %d account(s)",
+                start_date, end_date, len(ad_account_ids))
     ingested_at = datetime.now(timezone.utc)
 
     campaign_rows, ad_set_rows, ad_rows = [], [], []
     for ad_account_id in ad_account_ids:
         for c in list_entities(ad_account_id, access_token, "campaigns", CAMPAIGN_API_FIELDS,
-                                page_size=DETAIL_PAGE_SIZE):
+                                page_size=DETAIL_PAGE_SIZE,
+                                filtering=_created_time_filter("campaign", start_ts, end_ts)):
             campaign_rows.append(campaign_to_row(ad_account_id, c, ingested_at))
 
         for a in list_entities(ad_account_id, access_token, "adsets", AD_SET_API_FIELDS,
-                                page_size=DETAIL_PAGE_SIZE):
+                                page_size=DETAIL_PAGE_SIZE,
+                                filtering=_created_time_filter("adset", start_ts, end_ts)):
             ad_set_rows.append(ad_set_to_row(ad_account_id, a, ingested_at))
 
         for a in list_entities(ad_account_id, access_token, "ads", AD_API_FIELDS,
-                                page_size=DETAIL_PAGE_SIZE):
+                                page_size=DETAIL_PAGE_SIZE,
+                                filtering=_created_time_filter("ad", start_ts, end_ts)):
             ad_rows.append(ad_to_row(ad_account_id, a, ingested_at))
 
     logger.info("Fetched %d campaign(s), %d ad set(s), %d ad(s) across %d account(s)",
                 len(campaign_rows), len(ad_set_rows), len(ad_rows), len(ad_account_ids))
 
     # -- write -------------------------------------------------------------
-    # Each table is only written once, at the end, after every account has
-    # been fetched -- so a mid-run failure leaves existing tables untouched
-    # rather than partially overwritten. Full replace, not merge/upsert: see
-    # module docstring for why (deleted entities must disappear, not linger).
+    # Each table is written once, at the end, after every account has been
+    # fetched -- so a mid-run failure leaves existing tables untouched
+    # rather than partially merged. MERGE/upsert, not full replace: see
+    # module docstring's "created_time filtering + upsert" note for why.
     if campaign_rows:
         df = spark.createDataFrame(campaign_rows, schema=CAMPAIGN_SCHEMA)
-        replace_table(spark, df, f"{catalog}.{database}.{args['ICEBERG_TABLE_CAMPAIGNS']}",
-                      CAMPAIGN_ICEBERG_COLUMNS, temp_view_name="meta_campaigns_dim_source")
+        upsert(spark, df, f"{catalog}.{database}.{args['ICEBERG_TABLE_CAMPAIGNS']}",
+               CAMPAIGN_ICEBERG_COLUMNS, CAMPAIGN_KEY_COLUMNS, PARTITION_EXPR,
+               temp_view_name="meta_campaigns_dim_source")
     else:
-        logger.warning("No campaigns found, leaving %s untouched", args["ICEBERG_TABLE_CAMPAIGNS"])
+        logger.warning("No campaigns created in %s..%s, leaving %s untouched",
+                        start_date, end_date, args["ICEBERG_TABLE_CAMPAIGNS"])
 
     if ad_set_rows:
         df = spark.createDataFrame(ad_set_rows, schema=AD_SET_SCHEMA)
-        replace_table(spark, df, f"{catalog}.{database}.{args['ICEBERG_TABLE_AD_SETS']}",
-                      AD_SET_ICEBERG_COLUMNS, temp_view_name="meta_ad_sets_dim_source")
+        upsert(spark, df, f"{catalog}.{database}.{args['ICEBERG_TABLE_AD_SETS']}",
+               AD_SET_ICEBERG_COLUMNS, AD_SET_KEY_COLUMNS, PARTITION_EXPR,
+               temp_view_name="meta_ad_sets_dim_source")
     else:
-        logger.warning("No ad sets found, leaving %s untouched", args["ICEBERG_TABLE_AD_SETS"])
+        logger.warning("No ad sets created in %s..%s, leaving %s untouched",
+                        start_date, end_date, args["ICEBERG_TABLE_AD_SETS"])
 
     if ad_rows:
         df = spark.createDataFrame(ad_rows, schema=AD_SCHEMA)
-        replace_table(spark, df, f"{catalog}.{database}.{args['ICEBERG_TABLE_ADS']}",
-                      AD_ICEBERG_COLUMNS, temp_view_name="meta_ads_dim_source")
+        upsert(spark, df, f"{catalog}.{database}.{args['ICEBERG_TABLE_ADS']}",
+               AD_ICEBERG_COLUMNS, AD_KEY_COLUMNS, PARTITION_EXPR,
+               temp_view_name="meta_ads_dim_source")
     else:
-        logger.warning("No ads found, leaving %s untouched", args["ICEBERG_TABLE_ADS"])
+        logger.warning("No ads created in %s..%s, leaving %s untouched",
+                        start_date, end_date, args["ICEBERG_TABLE_ADS"])
 
     job.commit()
 
